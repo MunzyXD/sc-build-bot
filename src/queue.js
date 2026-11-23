@@ -2,79 +2,21 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import unzipper from 'unzipper';
-import { Input } from 'telegraf';
-import { config } from './config.js';
-import { builds } from './database.js';
+import {Input} from 'telegraf';
+import {config} from './config.js';
+import {builds,workspaces,history} from './database.js';
 import * as github from './github.js';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-let bot; let started=false;
+let bot;let started=false;
 export function attachBot(instance){bot=instance;}
-async function notify(chat,message){try{await bot.telegram.sendMessage(chat,message);}catch(e){console.error('Telegram notification:',e.message);}}
-async function setStatus(b,status,extra={}) {
- builds.update.run({id:b.id,status,workflow_run_id:extra.workflow_run_id??null,
-  dispatch_time:extra.dispatch_time??null,error:extra.error??null,artifact_name:extra.artifact_name??null});
-}
-async function deliverApk(build,run) {
- const artifacts=await github.getArtifacts(build.repo,run.id);
- const artifact=artifacts.find(a=>!a.expired&&a.name===`android-apk-build-${build.id}`)||artifacts.find(a=>!a.expired&&a.name.includes('android-apk'));
- if(!artifact) throw new Error('Artifact APK tidak ditemukan. Periksa langkah upload-artifact pada workflow.');
- const zip=await github.downloadArtifact(build.repo,artifact.id);
- const dir=await unzipper.Open.buffer(zip);
- const entries=dir.files.filter(f=>f.type==='File'&&f.path.toLowerCase().endsWith('.apk'));
- if(!entries.length) throw new Error('Artifact tidak berisi file APK.');
- const tmp=await fs.mkdtemp(path.join(os.tmpdir(),'sc-build-'));
- try {
-  for(const entry of entries) {
-   const data=await entry.buffer();
-   if(data.length>config.maxApkMb*1024*1024) throw new Error(`APK melebihi batas ${config.maxApkMb} MB.`);
-   const file=path.join(tmp,path.basename(entry.path)); await fs.writeFile(file,data);
-   await bot.telegram.sendDocument(build.chat_id,Input.fromLocalFile(file),{
-    caption:`Build #${build.id} berhasil\nRepo: ${build.repo}\nBranch: ${build.branch}\nVarian: ${build.variant}`
-   });
-  }
- } finally { await fs.rm(tmp,{recursive:true,force:true}); }
-}
-async function processBuild(initial) {
- let b=builds.get.get(initial.id); const startedAt=Date.now();
- try {
-  if(b.status==='QUEUED') {
-   const dispatchTime=new Date().toISOString();
-   await setStatus(b,'DISPATCHING',{dispatch_time:dispatchTime});
-   b=builds.get.get(b.id);
-   await github.dispatchBuild(b.repo,b.branch,b.variant,b.id);
-  }
-  // A DISPATCHING row is reconciled against recent runs after restart; it is never blindly re-dispatched.
-  if(!b.workflow_run_id) {
-   let run=null;
-   for(let i=0;i<12&&!run;i++){run=await github.findWorkflowRun(b.repo,b.branch,b.dispatch_time||b.created_at);if(!run)await sleep(5000);}
-   if(!run) throw new Error('Workflow run tidak ditemukan. Periksa tab Actions pada repository tujuan sebelum mencoba ulang.');
-   await setStatus(b,'RUNNING',{workflow_run_id:String(run.id)}); b=builds.get.get(b.id);
-  }
-  await notify(b.chat_id,`Build #${b.id} sedang berjalan. APK akan dikirim setelah selesai.`);
-  while(Date.now()-startedAt<config.buildTimeoutMinutes*60000) {
-   const run=await github.getWorkflowRun(b.repo,b.workflow_run_id);
-   if(run.status==='completed') {
-    if(run.conclusion!=='success') throw new Error(`GitHub Actions selesai dengan status: ${run.conclusion||'unknown'}`);
-    await deliverApk(b,run); await setStatus(b,'SUCCESS'); await notify(b.chat_id,`Build #${b.id} selesai. APK telah dikirim.`); return;
-   }
-   await sleep(config.pollIntervalMs);
-  }
-  throw new Error('Build melewati batas waktu.');
- } catch(e) {
-  const latest=builds.get.get(initial.id);
-  await setStatus(latest,'FAILED',{error:e.message.slice(0,900)});
-  await notify(latest.chat_id,`Build #${latest.id} gagal: ${e.message}`);
- }
-}
-export function startQueue() {
- if(started)return; started=true;
- (async()=>{while(true){const next=builds.active.get().find(b=>['QUEUED','DISPATCHING','RUNNING'].includes(b.status));if(!next){await sleep(2500);continue;}await processBuild(next);}})()
- .catch(e=>console.error('Queue worker stopped:',e));
-}
-export async function cancelBuild(id) {
- const b=builds.get.get(id); if(!b)throw new Error('Build ID tidak ditemukan.');
- if(['SUCCESS','FAILED','CANCELLED'].includes(b.status))throw new Error('Build sudah selesai.');
- if(b.workflow_run_id)await github.cancelWorkflowRun(b.repo,b.workflow_run_id);
- builds.update.run({id:b.id,status:'CANCELLED',workflow_run_id:null,dispatch_time:null,error:'Dibatalkan admin.',artifact_name:null});
- await notify(b.chat_id,`Build #${id} dibatalkan oleh admin.`); return b;
-}
+async function notify(chat,text){try{await bot.telegram.sendMessage(chat,text);}catch(e){console.error('Telegram notification failed:',e.message);}}
+function update(b,status,extra={}){builds.update.run({id:b.id,status,run_id:extra.run_id==null?null:String(extra.run_id),dispatch_time:extra.dispatch_time||null,finished_at:extra.finished_at||null,error:extra.error||null,artifact_id:extra.artifact_id==null?null:String(extra.artifact_id),artifact_name:extra.artifact_name||null,delivery_status:extra.delivery_status||null});}
+async function workspaceCreate(b){await fs.mkdir(config.workspaceRoot,{recursive:true});const name='tg-'+String(b.telegram_id||b.user_id)+'-'+b.build_id;const dir=await fs.mkdtemp(path.join(path.resolve(config.workspaceRoot),name+'-'));const now=new Date();workspaces.add.run({workspace_id:name,build_id:b.build_id,owner_id:b.telegram_id||b.user_id,path:dir,created_at:now.toISOString(),expires_at:new Date(now.getTime()+config.workspaceTtlHours*3600000).toISOString(),cleanup_status:'PENDING'});}
+async function workspaceCleanup(b){const w=workspaces.get.get(b.build_id);if(!w)return;try{await fs.rm(w.path,{recursive:true,force:true,maxRetries:3});workspaces.clean.run(b.build_id);await notify(b.chat_id,'Workspace '+w.workspace_id+' dibersihkan.');}catch(e){workspaces.retry.run(w.workspace_id,w.path,e.message.slice(0,300));}}
+function extractErrors(log){const safe=github.sanitizeLog(log);return(safe.split(/\\r?\\n/).filter(x=>/error|failed|exception|could not|unable to/i.test(x)).slice(-25).join('\\n')||'Ringkasan error tidak tersedia.').slice(-5000);}
+async function reportFailure(b,run,error){let summary=github.sanitizeLog(error);try{const jobs=await github.getJobs(b.repo,run.id);for(const job of jobs.filter(x=>x.conclusion==='failure').slice(0,2)){summary+='\\n'+job.name+'\\n'+extractErrors(await github.getJobLogs(b.repo,job.id));}}catch(e){summary+='\\nLog detail tidak tersedia: '+e.message;}const report='ANDROID BUILD FAILED\\nBuild ID: '+b.build_id+'\\nProject: '+b.repo+'\\nBranch: '+b.branch+'\\nWorkflow: '+run.html_url+'\\n\\n'+summary.slice(0,6500);const file=path.join(os.tmpdir(),'failed-'+b.build_id+'.txt');try{await fs.writeFile(file,report,{mode:0o600});await bot.telegram.sendDocument(b.chat_id,Input.fromLocalFile(file),{caption:'Build '+b.build_id+' gagal. Ringkasan terlampir.'});}catch{await notify(b.chat_id,report.slice(0,3500));}finally{await fs.rm(file,{force:true}).catch(()=>{});}}
+async function sendApk(b,run){const artifacts=await github.getArtifacts(b.repo,run.id);const artifact=artifacts.find(x=>!x.expired&&x.name==='android-apk-build-'+b.build_id);if(!artifact)throw new Error('Artifact APK tidak ditemukan.');const zip=await github.downloadArtifact(b.repo,artifact.id);const dir=await unzipper.Open.buffer(zip);const entries=dir.files.filter(x=>x.type==='File'&&x.path.toLowerCase().endsWith('.apk'));if(!entries.length)throw new Error('ZIP artifact tidak berisi APK.');let sent=0;for(const entry of entries){const data=await entry.buffer();if(!data.length||data.length>config.maxApkMb*1048576||data[0]!==0x50||data[1]!==0x4b)throw new Error('APK kosong, tidak valid, atau melebihi batas '+config.maxApkMb+' MB.');if(data.length>50*1048576){await notify(b.chat_id,'Ukuran APK '+(data.length/1048576).toFixed(1)+' MB. Unduh artifact melalui GitHub Actions: '+run.html_url);continue;}const name=path.basename(entry.path).replace(/[^A-Za-z0-9._-]/g,'_');const file=path.join(os.tmpdir(),'apk-'+b.build_id+'-'+name);try{await fs.writeFile(file,data,{mode:0o600});await bot.telegram.sendDocument(b.chat_id,Input.fromLocalFile(file),{caption:'ANDROID BUILD SUCCESS\\nProject: '+b.repo+'\\nBranch: '+b.branch+'\\nBuild ID: '+b.build_id});sent++;}finally{await fs.rm(file,{force:true}).catch(()=>{});}}return{artifact, sent};}
+async function processBuild(initial){let b=builds.get.get(initial.id);const start=Date.now();let run=null;let madeWorkspace=false;try{await workspaceCreate(b);madeWorkspace=true;await notify(b.chat_id,'Build '+b.build_id+' dipersiapkan. '+b.repo+' @ '+b.branch);const dispatchAt=new Date().toISOString();update(b,'DISPATCHING',{dispatch_time:dispatchAt});await github.dispatchBuild(b.repo,b.branch,b.variant,b.build_id);const deadline=Date.now()+config.buildTimeoutMinutes*60000;while(Date.now()<deadline){if(builds.get.get(b.id)?.status==='CANCELLED')return;if(!run){run=await github.findWorkflowRun(b.repo,b.branch,dispatchAt);if(run){update(b,'RUNNING',{run_id:run.id});b=builds.get.get(b.id);await notify(b.chat_id,'Build '+b.build_id+' berjalan. Workflow run: '+run.id);}}if(run){const latest=await github.getWorkflowRun(b.repo,run.id);if(latest.status==='completed'){run=latest;if(latest.conclusion!=='success')throw new Error('Workflow selesai dengan status '+latest.conclusion);const result=await sendApk(b,latest);const status=result.sent?'SENT':'LINK_ONLY';update(b,'SUCCESS',{finished_at:new Date().toISOString(),artifact_id:result.artifact.id,artifact_name:result.artifact.name,delivery_status:status});history.add.run({build_id:b.build_id,result:'SUCCESS',duration_ms:Date.now()-start,artifact_name:result.artifact.name,delivery_status:status,error_summary:null,finished_at:new Date().toISOString()});await notify(b.chat_id,'Build '+b.build_id+' SUCCESS. APK siap.');return;}const jobs=await github.getJobs(b.repo,run.id);const steps=jobs.flatMap(j=>j.steps||[]);const current=steps.find(s=>s.status==='in_progress');const done=steps.filter(s=>s.status==='completed').length;await notify(b.chat_id,'Build '+b.build_id+' — '+(current?.name||latest.status)+'\\nTahapan selesai: '+done+'/'+Math.max(steps.length,1)+' (estimasi).');}await sleep(config.pollIntervalMs);}throw new Error('Build timeout setelah '+config.buildTimeoutMinutes+' menit.');}catch(e){b=builds.get.get(initial.id);if(b.status!=='CANCELLED'){const msg=github.sanitizeLog(e.message).slice(0,900);update(b,'FAILED',{finished_at:new Date().toISOString(),error:msg,delivery_status:'FAILED'});history.add.run({build_id:b.build_id,result:'FAILED',duration_ms:Date.now()-start,artifact_name:null,delivery_status:'FAILED',error_summary:msg,finished_at:new Date().toISOString()});if(run)await reportFailure(b,run,msg);else await notify(b.chat_id,'Build '+b.build_id+' gagal: '+msg);}}finally{b=builds.get.get(initial.id);if(madeWorkspace)await workspaceCleanup(b);}}
+async function worker(){while(true){const next=builds.claimNext();if(!next){await sleep(2000);continue;}await processBuild(next);}}
+export function startQueue(){if(started)return;started=true;for(let i=0;i<config.maxConcurrentBuilds;i++)worker().catch(e=>console.error('Queue worker stopped:',e));}
+export async function cancelBuild(id){const b=builds.get.get(id);if(!b)throw new Error('Build ID tidak ditemukan.');if(['SUCCESS','FAILED','CANCELLED','EXPIRED'].includes(b.status))throw new Error('Build sudah selesai.');if(b.workflow_run_id)await github.cancelWorkflowRun(b.repo,b.workflow_run_id);update(b,'CANCELLED',{finished_at:new Date().toISOString(),error:'Dibatalkan administrator.'});await notify(b.chat_id,'Build '+b.build_id+' dibatalkan.');return b;}

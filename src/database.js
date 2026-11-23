@@ -1,40 +1,28 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
-import { config } from './config.js';
-fs.mkdirSync(path.dirname(path.resolve(config.dbPath)), { recursive: true });
-const db = new Database(config.dbPath);
-db.pragma('journal_mode = WAL');
-db.exec(`
-CREATE TABLE IF NOT EXISTS repositories (
- id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL UNIQUE,
- default_branch TEXT NOT NULL DEFAULT 'main', variant TEXT NOT NULL DEFAULT 'debug',
- created_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS builds (
- id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, branch TEXT NOT NULL,
- variant TEXT NOT NULL, chat_id TEXT NOT NULL, user_id TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'QUEUED', workflow_run_id TEXT, dispatch_time TEXT,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- error TEXT, artifact_name TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
-`);
-export const repositories = {
- add: db.prepare(`INSERT INTO repositories(full_name,default_branch,variant,created_by) VALUES(?,?,?,?)
- ON CONFLICT(full_name) DO UPDATE SET default_branch=excluded.default_branch,variant=excluded.variant`),
- list: db.prepare('SELECT * FROM repositories ORDER BY full_name'),
- get: db.prepare('SELECT * FROM repositories WHERE full_name=?'),
- remove: db.prepare('DELETE FROM repositories WHERE full_name=?')
-};
-export const builds = {
- create: db.prepare("INSERT INTO builds(repo,branch,variant,chat_id,user_id,status) VALUES(?,?,?,?,?,'QUEUED')"),
- get: db.prepare('SELECT * FROM builds WHERE id=?'),
- recent: db.prepare('SELECT * FROM builds ORDER BY id DESC LIMIT 15'),
- active: db.prepare("SELECT * FROM builds WHERE status IN ('QUEUED','DISPATCHING','RUNNING') ORDER BY id"),
- update: db.prepare(`UPDATE builds SET status=@status,workflow_run_id=COALESCE(@workflow_run_id,workflow_run_id),
- dispatch_time=COALESCE(@dispatch_time,dispatch_time),updated_at=CURRENT_TIMESTAMP,error=@error,
- artifact_name=COALESCE(@artifact_name,artifact_name) WHERE id=@id`),
- countActive: db.prepare("SELECT COUNT(*) AS count FROM builds WHERE status IN ('QUEUED','DISPATCHING','RUNNING')")
-};
-export function closeDatabase() { db.close(); }
+import {config} from './config.js';
+fs.mkdirSync(path.dirname(path.resolve(config.dbPath)),{recursive:true});
+const db=new Database(config.dbPath);
+db.pragma('journal_mode = WAL');db.pragma('foreign_keys = ON');db.pragma('busy_timeout = 5000');
+db.exec([
+"CREATE TABLE IF NOT EXISTS users(telegram_id TEXT PRIMARY KEY,username TEXT,role TEXT NOT NULL DEFAULT 'ADMIN',created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_seen_at TEXT)",
+"CREATE TABLE IF NOT EXISTS repositories(id INTEGER PRIMARY KEY AUTOINCREMENT,full_name TEXT NOT NULL UNIQUE,owner TEXT,name TEXT,default_branch TEXT NOT NULL DEFAULT 'main',allowed_branches TEXT NOT NULL DEFAULT '[\\"main\\"]',variant TEXT NOT NULL DEFAULT 'debug',apk_glob TEXT NOT NULL DEFAULT '**/build/outputs/apk/**/*.apk',created_by TEXT NOT NULL DEFAULT 'system',created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+"CREATE TABLE IF NOT EXISTS builds(id INTEGER PRIMARY KEY AUTOINCREMENT,build_id TEXT UNIQUE,repo TEXT NOT NULL,branch TEXT NOT NULL,variant TEXT NOT NULL,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,telegram_id TEXT,status TEXT NOT NULL DEFAULT 'QUEUED',workflow_run_id TEXT,dispatch_time TEXT,queued_at TEXT,started_at TEXT,finished_at TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,error TEXT,artifact_id TEXT,artifact_name TEXT,delivery_status TEXT DEFAULT 'PENDING')",
+"CREATE TABLE IF NOT EXISTS workspaces(workspace_id TEXT PRIMARY KEY,build_id TEXT UNIQUE,owner_id TEXT,path TEXT,created_at TEXT,expires_at TEXT,cleanup_status TEXT DEFAULT 'PENDING')",
+"CREATE TABLE IF NOT EXISTS build_history(id INTEGER PRIMARY KEY AUTOINCREMENT,build_id TEXT UNIQUE,result TEXT,duration_ms INTEGER,artifact_name TEXT,delivery_status TEXT,error_summary TEXT,finished_at TEXT)",
+"CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,telegram_id TEXT,action TEXT,details TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+"CREATE TABLE IF NOT EXISTS cleanup_retry(id INTEGER PRIMARY KEY AUTOINCREMENT,workspace_id TEXT,path TEXT,attempts INTEGER DEFAULT 0,last_error TEXT)"
+].join('\\n'));
+function addColumn(table,name,definition){const cols=db.prepare('PRAGMA table_info('+table+')').all();if(!cols.some(c=>c.name===name))db.exec('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition);}
+for(const [name,definition] of Object.entries({owner:'TEXT',name:'TEXT',allowed_branches:"TEXT NOT NULL DEFAULT '[\\"main\\"]'",apk_glob:"TEXT NOT NULL DEFAULT '**/build/outputs/apk/**/*.apk'"}))addColumn('repositories',name,definition);
+for(const [name,definition] of Object.entries({build_id:'TEXT',telegram_id:'TEXT',queued_at:'TEXT',started_at:'TEXT',finished_at:'TEXT',artifact_id:'TEXT',delivery_status:"TEXT DEFAULT 'PENDING'"}))addColumn('builds',name,definition);
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_build_id ON builds(build_id) WHERE build_id IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_build_status ON builds(status,queued_at,id);");
+export const users={upsert:db.prepare("INSERT INTO users(telegram_id,username,role,last_seen_at) VALUES(@telegram_id,@username,'ADMIN',CURRENT_TIMESTAMP) ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username,last_seen_at=CURRENT_TIMESTAMP")};
+export const audit={add:db.prepare('INSERT INTO audit_logs(telegram_id,action,details) VALUES(?,?,?)')};
+export const repositories={add:db.prepare("INSERT INTO repositories(full_name,owner,name,default_branch,allowed_branches,variant,apk_glob,created_by) VALUES(@full_name,@owner,@name,@default_branch,@allowed_branches,@variant,@apk_glob,@created_by) ON CONFLICT(full_name) DO UPDATE SET owner=excluded.owner,name=excluded.name,default_branch=excluded.default_branch,allowed_branches=excluded.allowed_branches,variant=excluded.variant"),list:db.prepare('SELECT * FROM repositories ORDER BY full_name'),get:db.prepare('SELECT * FROM repositories WHERE id=?'),getName:db.prepare('SELECT * FROM repositories WHERE full_name=?'),remove:db.prepare('DELETE FROM repositories WHERE full_name=?')};
+const claim=db.transaction(()=>{const row=db.prepare("SELECT * FROM builds WHERE status='QUEUED' ORDER BY queued_at,id LIMIT 1").get();if(!row)return null;const result=db.prepare("UPDATE builds SET status='PREPARING',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='QUEUED'").run(row.id);return result.changes?db.prepare('SELECT * FROM builds WHERE id=?').get(row.id):null;});
+export const builds={enqueue:db.prepare("INSERT INTO builds(build_id,repo,branch,variant,chat_id,user_id,telegram_id,status,queued_at) VALUES(@build_id,@repo,@branch,@variant,@chat_id,@user_id,@telegram_id,'QUEUED',CURRENT_TIMESTAMP)"),get:db.prepare('SELECT * FROM builds WHERE id=?'),active:db.prepare("SELECT * FROM builds WHERE status IN ('QUEUED','PREPARING','DISPATCHING','RUNNING') ORDER BY queued_at,id"),recent:db.prepare('SELECT * FROM builds ORDER BY id DESC LIMIT 20'),countActive:db.prepare("SELECT COUNT(*) AS count FROM builds WHERE status IN ('QUEUED','PREPARING','DISPATCHING','RUNNING')"),claimNext:claim,update:db.prepare("UPDATE builds SET status=@status,workflow_run_id=COALESCE(@run_id,workflow_run_id),dispatch_time=COALESCE(@dispatch_time,dispatch_time),finished_at=COALESCE(@finished_at,finished_at),updated_at=CURRENT_TIMESTAMP,error=@error,artifact_id=COALESCE(@artifact_id,artifact_id),artifact_name=COALESCE(@artifact_name,artifact_name),delivery_status=COALESCE(@delivery_status,delivery_status) WHERE id=@id")};
+export const workspaces={add:db.prepare('INSERT OR REPLACE INTO workspaces(workspace_id,build_id,owner_id,path,created_at,expires_at,cleanup_status) VALUES(@workspace_id,@build_id,@owner_id,@path,@created_at,@expires_at,@cleanup_status)'),get:db.prepare('SELECT * FROM workspaces WHERE build_id=?'),clean:db.prepare("UPDATE workspaces SET cleanup_status='CLEANED' WHERE build_id=?"),retry:db.prepare('INSERT INTO cleanup_retry(workspace_id,path,last_error) VALUES(?,?,?)')};
+export const history={add:db.prepare('INSERT OR REPLACE INTO build_history(build_id,result,duration_ms,artifact_name,delivery_status,error_summary,finished_at) VALUES(@build_id,@result,@duration_ms,@artifact_name,@delivery_status,@error_summary,@finished_at)')};
+export function closeDatabase(){db.close();}

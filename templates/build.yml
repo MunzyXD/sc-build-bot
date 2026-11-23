@@ -8,23 +8,38 @@ on:
         type: choice
         options: [debug, release]
         default: debug
+      build_id:
+        description: Unique build ID
+        required: true
+        type: string
       artifact_name:
         description: Artifact name
         required: true
         type: string
-        default: android-apk
 permissions:
   contents: read
 concurrency:
-  group: android-build-${{ github.ref }}
+  group: android-build-\${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          [[ "\${{ inputs.build_id }}" =~ ^[A-Fa-f0-9]{6,16}$ ]] || exit 1
+          [[ "\${{ inputs.variant }}" == "debug" || "\${{ inputs.variant }}" == "release" ]] || exit 1
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate Gradle project
+        run: |
+          test -f ./gradlew
+          test -f settings.gradle -o -f settings.gradle.kts
+          chmod +x ./gradlew
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -33,18 +48,55 @@ jobs:
           cache: gradle
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-      - name: Grant Gradle permission
-        run: chmod +x ./gradlew
-      - name: Build debug APK
-        if: inputs.variant == 'debug'
-        run: ./gradlew assembleDebug --no-daemon
-      - name: Build release APK
-        if: inputs.variant == 'release'
-        run: ./gradlew assembleRelease --no-daemon
-      - name: Upload APK
+      - name: Resolve dependencies
+        run: ./gradlew dependencies --no-daemon
+      - name: Compile APK
+        shell: bash
+        run: |
+          set -o pipefail
+          if [[ "\${{ inputs.variant }}" == "release" ]]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build-output.log
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build-output.log
+          fi
+      - name: Validate APK output
+        shell: bash
+        run: |
+          mapfile -t apks < <(find . -type f -path "*/build/outputs/apk/*" -name "*.apk" -size +0c)
+          test "\${#apks[@]}" -gt 0
+          printf '%s\n' "\${apks[@]}"
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.artifact_name }}
-          path: app/build/outputs/apk/**/*.apk
+          name: \${{ inputs.artifact_name }}
+          path: '**/build/outputs/apk/**/*.apk'
           if-no-files-found: error
+          retention-days: 3
+          compression-level: 1
+      - name: Write build summary
+        if: always()
+        run: |
+          {
+            echo "## Android APK Build"
+            echo "- Build ID: \${{ inputs.build_id }}"
+            echo "- Branch: \${{ github.ref_name }}"
+            echo "- Variant: \${{ inputs.variant }}"
+            echo "- Result: \${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Prepare failure summary
+        if: failure()
+        shell: bash
+        run: |
+          if [[ -f build-output.log ]]; then
+            sed -E -e 's/(gh[pousr]_[A-Za-z0-9_]{20,})/[REDACTED_TOKEN]/g' -e 's/(github_pat_[A-Za-z0-9_]{20,})/[REDACTED_TOKEN]/g' build-output.log | grep -Ei 'error|failed|exception|could not|unable to' | tail -n 80 > failure-summary.txt || true
+          else
+            echo "Build failed before Gradle output was generated." > failure-summary.txt
+          fi
+      - name: Upload failure summary
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-error-\${{ inputs.build_id }}
+          path: failure-summary.txt
+          if-no-files-found: warn
           retention-days: 3

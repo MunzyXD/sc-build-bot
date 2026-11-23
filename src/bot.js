@@ -1,74 +1,32 @@
-import {Telegraf} from 'telegraf';
+import {Telegraf,Markup} from 'telegraf';
+import crypto from 'node:crypto';
 import {config} from './config.js';
-import {repositories,builds} from './database.js';
+import {users,repositories,builds,audit} from './database.js';
 import {attachBot,startQueue,cancelBuild} from './queue.js';
 import * as github from './github.js';
-export const bot=new Telegraf(config.botToken); attachBot(bot);
-const admin=ctx=>config.adminIds.has(String(ctx.from?.id));
-bot.use(async(ctx,next)=>{if(!admin(ctx))return ctx.reply('Akses ditolak. Bot ini hanya untuk admin terdaftar.');return next();});
-const help=`<b>SC Android Build Bot</b>
-/start atau /help - Bantuan
-/addrepo owner/repo branch [debug|release] - Daftarkan repo
-/listrepo - Daftar repo
-/delrepo owner/repo - Hapus pendaftaran lokal
-/buildapp owner/repo branch - Jalankan build
-/status [id] - Status build
-/history - Riwayat build
-/cancel id - Batalkan build
-
-Contoh: <code>/addrepo MunzyXD/aplikasi main debug</code>
-Contoh: <code>/buildapp MunzyXD/aplikasi main</code>
-
-Pasang file <code>templates/build.yml</code> dari project bot ke <code>.github/workflows/build.yml</code> di setiap repo Android tujuan.`;
-bot.start(ctx=>ctx.reply(help,{parse_mode:'HTML'}));
+export const bot=new Telegraf(config.botToken);attachBot(bot);
+const pending=new Map();const limits=new Map();
+const help='<b>SC Android Build Bot</b>\\n/start — menu\\n/buildapp — pilih project dan branch\\n/addrepo owner/repo main,dev debug — daftarkan repo\\n/listrepo — daftar repo\\n/delrepo owner/repo — hapus pendaftaran lokal\\n/status [id] — status build\\n/history — riwayat\\n/cancel id — batalkan\\n/help — bantuan';
+bot.use(async(ctx,next)=>{const id=String(ctx.from?.id||'');if(!config.adminIds.has(id)){if(ctx.callbackQuery)return ctx.answerCbQuery('Akses ditolak.');return ctx.reply('Akses ditolak. Telegram ID bukan administrator.');}const now=Date.now();const recent=(limits.get(id)||[]).filter(t=>now-t<60000);if(recent.length>=30)return ctx.reply('Rate limit: tunggu satu menit.');recent.push(now);limits.set(id,recent);users.upsert.run({telegram_id:id,username:ctx.from.username||null});return next();});
+const log=(ctx,action,details='')=>audit.add.run(String(ctx.from.id),action,String(details).slice(0,300));
+function repoName(s){if(!/^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$/.test(s||''))throw new Error('Gunakan format owner/repo.');return s;}
+async function chooseRepo(ctx){const rows=repositories.list.all();if(!rows.length)return ctx.reply('Belum ada repository. Gunakan /addrepo.');return ctx.reply('PILIH PROJECT ANDROID',Markup.inlineKeyboard(rows.map(r=>[Markup.button.callback(r.full_name,'repo:'+r.id)])));}
+bot.start(async ctx=>{log(ctx,'START');const api=await github.getRepository('MunzyXD/sc-build-bot').then(()=> 'Online').catch(()=> 'Unavailable');return ctx.reply('<b>SC Android Build Bot</b>\\nCreator: @MúnzyXD\\nPrefix: /\\nUptime: '+Math.floor(process.uptime())+'s\\nAccess: Developer\\nFramework: Telegraf\\nGitHub API: '+api+'\\nQueue aktif: '+builds.countActive.get().count,{parse_mode:'HTML',...Markup.inlineKeyboard([[Markup.button.callback('Build APK','menu:build')],[Markup.button.callback('Status','menu:status'),Markup.button.callback('History','menu:history')]])});});
 bot.help(ctx=>ctx.reply(help,{parse_mode:'HTML'}));
-bot.command('addrepo',async ctx=>{
- const a=ctx.message.text.trim().split(/\s+/).slice(1);
- if(a.length<2)return ctx.reply('Format: /addrepo owner/repo branch [debug|release]');
- const [repo,branch,variant='debug']=a;
- if(!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo))return ctx.reply('Format repo harus owner/repo.');
- if(!['debug','release'].includes(variant))return ctx.reply('Varian harus debug atau release.');
- try {
-  const meta=await github.getRepository(repo);
-  if(meta.archived||meta.disabled)return ctx.reply('Repository tidak aktif atau diarsipkan.');
-  await github.validateBranch(repo,branch);
-  repositories.add.run(repo,branch,variant,String(ctx.from.id));
-  return ctx.reply(`Repository ${repo} terdaftar. Branch: ${branch}. Varian: ${variant}.`);
- }catch(e){return ctx.reply(`Gagal mendaftarkan repository: ${e.message}`);}
-});
-bot.command('listrepo',ctx=>{
- const rows=repositories.list.all(); if(!rows.length)return ctx.reply('Belum ada repository terdaftar.');
- return ctx.reply(rows.map((r,i)=>`${i+1}. ${r.full_name} | ${r.default_branch} | ${r.variant}`).join('\n'));
-});
-bot.command('delrepo',ctx=>{
- const repo=ctx.message.text.trim().split(/\s+/)[1];if(!repo)return ctx.reply('Format: /delrepo owner/repo');
- const out=repositories.remove.run(repo);return ctx.reply(out.changes?`Pendaftaran ${repo} dihapus. Repository GitHub tidak ikut dihapus.`:'Repository tidak ditemukan.');
-});
-bot.command('buildapp',async ctx=>{
- const [repo,branch]=ctx.message.text.trim().split(/\s+/).slice(1);
- if(!repo||!branch)return ctx.reply('Format: /buildapp owner/repo branch');
- const reg=repositories.get.get(repo);if(!reg)return ctx.reply('Repo belum terdaftar. Gunakan /addrepo.');
- try {
-  await github.validateBranch(repo,branch);
-  if(builds.countActive.get().count>=config.maxQueueSize)return ctx.reply('Antrean penuh. Coba lagi nanti.');
-  const row=builds.create.run(repo,branch,reg.variant,String(ctx.chat.id),String(ctx.from.id));
-  const id=Number(row.lastInsertRowid);
-  return ctx.reply(`Build #${id} masuk antrean.\nRepo: ${repo}\nBranch: ${branch}\nVarian: ${reg.variant}`);
- }catch(e){return ctx.reply(`Gagal membuat build: ${e.message}`);}
-});
-bot.command('status',ctx=>{
- const arg=ctx.message.text.trim().split(/\s+/)[1];
- const rows=arg?[builds.get.get(Number(arg))].filter(Boolean):builds.active.get();
- if(!rows.length)return ctx.reply('Tidak ada build aktif atau ID tidak ditemukan.');
- return ctx.reply(rows.map(b=>`#${b.id} | ${b.status}\n${b.repo} @ ${b.branch}${b.error?'\nError: '+b.error:''}`).join('\n\n'));
-});
-bot.command('history',ctx=>{
- const rows=builds.recent.all();if(!rows.length)return ctx.reply('Belum ada riwayat build.');
- return ctx.reply(rows.map(b=>`#${b.id} [${b.status}] ${b.repo} @ ${b.branch}`).join('\n'));
-});
-bot.command('cancel',async ctx=>{
- const id=Number(ctx.message.text.trim().split(/\s+/)[1]);if(!Number.isInteger(id)||id<1)return ctx.reply('Format: /cancel id');
- try{await cancelBuild(id);return ctx.reply(`Build #${id} dibatalkan.`);}catch(e){return ctx.reply(e.message);}
-});
-bot.catch((e,ctx)=>{console.error('Telegram handler error:',e);ctx.reply('Terjadi kesalahan. Periksa log server.').catch(()=>{});});
+bot.action('menu:build',async ctx=>{await ctx.answerCbQuery();return chooseRepo(ctx);});
+bot.action('menu:status',async ctx=>{await ctx.answerCbQuery();return status(ctx);});
+bot.action('menu:history',async ctx=>{await ctx.answerCbQuery();return historyView(ctx);});
+bot.action(/^repo:(\\d+)$/,async ctx=>{await ctx.answerCbQuery();const r=repositories.get.get(Number(ctx.match[1]));if(!r)return ctx.reply('Repository tidak ditemukan.');pending.set(String(ctx.from.id),{repoId:r.id,created:Date.now()});const branches=JSON.parse(r.allowed_branches||'[]');return ctx.reply('PILIH BRANCH — '+r.full_name,Markup.inlineKeyboard(branches.map(b=>[Markup.button.callback(b,'branch:'+encodeURIComponent(b))])));});
+bot.action(/^branch:(.+)$/,async ctx=>{await ctx.answerCbQuery();const p=pending.get(String(ctx.from.id));if(!p||Date.now()-p.created>600000)return ctx.reply('Sesi kedaluwarsa. Jalankan /buildapp.');const r=repositories.get.get(p.repoId);const branch=decodeURIComponent(ctx.match[1]);if(!r||!JSON.parse(r.allowed_branches||'[]').includes(branch))return ctx.reply('Branch tidak diizinkan.');p.branch=branch;pending.set(String(ctx.from.id),p);return ctx.reply('KONFIRMASI BUILD\\nProject: '+r.full_name+'\\nBranch: '+branch+'\\nVariant: '+r.variant,Markup.inlineKeyboard([[Markup.button.callback('Konfirmasi','confirm'),Markup.button.callback('Batal','abort')]]));});
+bot.action('confirm',async ctx=>{await ctx.answerCbQuery();const id=String(ctx.from.id);const p=pending.get(id);pending.delete(id);if(!p||!p.branch||Date.now()-p.created>600000)return ctx.reply('Sesi build kedaluwarsa.');const r=repositories.get.get(p.repoId);if(!r||!JSON.parse(r.allowed_branches||'[]').includes(p.branch))return ctx.reply('Repository atau branch tidak diizinkan.');try{if(builds.countActive.get().count>=config.maxQueueSize)return ctx.reply('Antrean penuh.');await github.validateAndroidProject(r.full_name,p.branch);const buildId=crypto.randomBytes(3).toString('hex').toUpperCase();const result=builds.enqueue.run({build_id:buildId,repo:r.full_name,branch:p.branch,variant:r.variant,chat_id:String(ctx.chat.id),user_id:id,telegram_id:id});log(ctx,'BUILD_QUEUED',buildId);return ctx.reply('Build masuk antrean.\\nQueue ID: '+result.lastInsertRowid+'\\nBuild ID: '+buildId+'\\nProject: '+r.full_name+'\\nBranch: '+p.branch+'\\nStatus: QUEUED');}catch(e){return ctx.reply('Gagal membuat build: '+e.message);}});
+bot.action('abort',async ctx=>{pending.delete(String(ctx.from.id));await ctx.answerCbQuery('Dibatalkan');return ctx.reply('Permintaan build dibatalkan.');});
+bot.command('buildapp',async ctx=>{const a=ctx.message.text.trim().split(/\\s+/).slice(1);if(!a.length)return chooseRepo(ctx);const r=repositories.getName.get(repoName(a[0]));if(!r)return ctx.reply('Repository belum terdaftar.');const branch=a[1];if(!branch||!JSON.parse(r.allowed_branches||'[]').includes(branch))return ctx.reply('Branch tidak diizinkan. Pilihan: '+JSON.parse(r.allowed_branches||'[]').join(', '));pending.set(String(ctx.from.id),{repoId:r.id,branch,created:Date.now()});return ctx.reply('Konfirmasi '+r.full_name+' @ '+branch,Markup.inlineKeyboard([[Markup.button.callback('Konfirmasi','confirm'),Markup.button.callback('Batal','abort')]]));});
+bot.command('addrepo',async ctx=>{const a=ctx.message.text.trim().split(/\\s+/).slice(1);if(a.length<2)return ctx.reply('Format: /addrepo owner/repo branch1,branch2 [debug|release]');try{const full=repoName(a[0]);const branches=[...new Set(a[1].split(',').filter(Boolean))];const variant=a[2]||'debug';if(!branches.length||branches.length>20||!['debug','release'].includes(variant))throw new Error('Branch 1–20; variant debug atau release.');const meta=await github.getRepository(full);if(meta.archived||meta.disabled)throw new Error('Repository diarsipkan/nonaktif.');for(const b of branches)await github.validateAndroidProject(full,b);const [owner,name]=full.split('/');repositories.add.run({full_name:full,owner,name,default_branch:branches[0],allowed_branches:JSON.stringify(branches),variant,apk_glob:'**/build/outputs/apk/**/*.apk',created_by:String(ctx.from.id)});log(ctx,'REPOSITORY_ADDED',full);return ctx.reply('Repository terdaftar: '+full+'\\nBranch: '+branches.join(', ')+'\\nVariant: '+variant);}catch(e){return ctx.reply('Gagal mendaftarkan repository: '+e.message);}});
+bot.command('listrepo',ctx=>{const rows=repositories.list.all();return ctx.reply(rows.length?rows.map((r,i)=>(i+1)+'. '+r.full_name+'\\nBranch: '+JSON.parse(r.allowed_branches||'[]').join(', ')+'\\nVariant: '+r.variant).join('\\n\\n'):'Belum ada repository.');});
+bot.command('delrepo',ctx=>{const name=ctx.message.text.trim().split(/\\s+/)[1];if(!name)return ctx.reply('Format: /delrepo owner/repo');const result=repositories.remove.run(name);if(result.changes)log(ctx,'REPOSITORY_UNREGISTERED',name);return ctx.reply(result.changes?'Pendaftaran dihapus. Repository GitHub asli tidak dihapus.':'Repository tidak ditemukan.');});
+async function status(ctx){const arg=ctx.message?.text?.trim().split(/\\s+/)[1];const rows=arg?[builds.get.get(Number(arg))].filter(Boolean):builds.active.all();return ctx.reply(rows.length?rows.map(b=>'#'+b.id+' '+b.build_id+' | '+b.status+'\\n'+b.repo+' @ '+b.branch+'\\nRun: '+(b.workflow_run_id||'-')+(b.error?'\\nError: '+b.error:'')).join('\\n\\n'):'Tidak ada build aktif / ID tidak ditemukan.');}
+async function historyView(ctx){const rows=builds.recent.all();return ctx.reply(rows.length?rows.map(b=>'#'+b.id+' '+b.build_id+' ['+b.status+']\\n'+b.repo+' @ '+b.branch+'\\nMulai: '+(b.started_at||b.queued_at||'-')+' | Selesai: '+(b.finished_at||'-')).join('\\n\\n'):'Belum ada riwayat build.');}
+bot.command('status',status);bot.command('history',historyView);
+bot.command('cancel',async ctx=>{const id=Number(ctx.message.text.trim().split(/\\s+/)[1]);if(!Number.isInteger(id)||id<1)return ctx.reply('Format: /cancel queue_id');try{const b=await cancelBuild(id);log(ctx,'BUILD_CANCELLED',b.build_id);return ctx.reply('Build '+b.build_id+' dibatalkan.');}catch(e){return ctx.reply(e.message);}});
+bot.catch((e,ctx)=>{console.error('Telegram handler error:',e.message);if(ctx?.chat?.id)ctx.reply('Terjadi kesalahan internal.').catch(()=>{});});
 export function launchBot(){startQueue();return bot.launch();}

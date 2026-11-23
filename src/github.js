@@ -1,39 +1,17 @@
-import { config } from './config.js';
-const headers = { Authorization: `Bearer ${config.githubToken}`, Accept: 'application/vnd.github+json',
- 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'SC-APK-Build-Bot' };
-async function request(endpoint, options={}) {
- const response = await fetch(`${config.githubApiUrl}${endpoint}`, { ...options, headers:{...headers,...(options.headers||{})} });
- const body = await response.text(); let data;
- try { data = body ? JSON.parse(body) : {}; } catch { data = {message:body}; }
- if (!response.ok) throw new Error(`GitHub API ${response.status}: ${data.message||response.statusText}`);
- return data;
-}
-function validateRepo(repo) { if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('Format repository harus owner/repo.'); }
-export async function getRepository(repo) { validateRepo(repo); return request(`/repos/${repo}`); }
-export async function validateBranch(repo, branch) {
- validateRepo(repo);
- if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes('..')) throw new Error('Nama branch tidak valid.');
- return request(`/repos/${repo}/branches/${encodeURIComponent(branch)}`);
-}
-export async function dispatchBuild(repo, branch, variant, buildId) {
- validateRepo(repo);
- await request(`/repos/${repo}/actions/workflows/build.yml/dispatches`, {
-  method:'POST', headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({ref:branch,inputs:{variant,artifact_name:`android-apk-build-${buildId}`}})
- });
- return {dispatchedAt:new Date().toISOString()};
-}
-export async function findWorkflowRun(repo, branch, since) {
- const data = await request(`/repos/${repo}/actions/workflows/build.yml/runs?branch=${encodeURIComponent(branch)}&event=workflow_dispatch&per_page=20`);
- const threshold = new Date(since).getTime()-30000;
- return (data.workflow_runs||[]).filter(r=>new Date(r.created_at).getTime()>=threshold)
-  .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] || null;
-}
-export async function getWorkflowRun(repo,id) { return request(`/repos/${repo}/actions/runs/${id}`); }
-export async function cancelWorkflowRun(repo,id) { return request(`/repos/${repo}/actions/runs/${id}/cancel`,{method:'POST'}); }
-export async function getArtifacts(repo,id) { const d=await request(`/repos/${repo}/actions/runs/${id}/artifacts`); return d.artifacts||[]; }
-export async function downloadArtifact(repo,id) {
- const response=await fetch(`${config.githubApiUrl}/repos/${repo}/actions/artifacts/${id}/zip`,{headers,redirect:'follow'});
- if(!response.ok) throw new Error(`Gagal mengunduh artifact: HTTP ${response.status}`);
- return Buffer.from(await response.arrayBuffer());
-}
+import {config} from './config.js';
+const headers={Authorization:'Bearer '+config.githubToken,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'SC-APK-Build-Bot'};
+async function request(endpoint,options={}){const res=await fetch(config.githubApiUrl+endpoint,{...options,headers:{...headers,...(options.headers||{})},signal:AbortSignal.timeout(30000)});const raw=await res.text();let data={};try{data=raw?JSON.parse(raw):{};}catch{data={message:raw};}if(!res.ok)throw new Error('GitHub API '+res.status+': '+(data.message||res.statusText));return data;}
+function validRepo(repo){if(!/^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$/.test(repo||''))throw new Error('Format repository harus owner/repo.');}
+function validBranch(branch){if(!/^[A-Za-z0-9._/-]{1,200}$/.test(branch||'')||branch.includes('..')||branch.startsWith('/')||branch.endsWith('/'))throw new Error('Nama branch tidak valid.');}
+export async function getRepository(repo){validRepo(repo);return request('/repos/'+repo);}
+export async function validateBranch(repo,branch){validRepo(repo);validBranch(branch);return request('/repos/'+repo+'/branches/'+encodeURIComponent(branch));}
+export async function validateAndroidProject(repo,branch){const info=await validateBranch(repo,branch);const tree=await request('/repos/'+repo+'/git/trees/'+info.commit.sha+'?recursive=1');if(tree.truncated)throw new Error('Tree repository terlalu besar untuk divalidasi.');const paths=new Set((tree.tree||[]).map(x=>x.path));if(!paths.has('gradlew'))throw new Error('gradlew tidak ditemukan di root.');if(!paths.has('settings.gradle')&&!paths.has('settings.gradle.kts'))throw new Error('settings.gradle(.kts) tidak ditemukan di root.');return info;}
+export async function dispatchBuild(repo,branch,variant,buildId){validRepo(repo);validBranch(branch);return request('/repos/'+repo+'/actions/workflows/build.yml/dispatches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ref:branch,inputs:{variant,build_id:buildId,artifact_name:'android-apk-build-'+buildId}})});}
+export async function findWorkflowRun(repo,branch,since){const data=await request('/repos/'+repo+'/actions/workflows/build.yml/runs?branch='+encodeURIComponent(branch)+'&event=workflow_dispatch&per_page=30');const min=new Date(since).getTime()-30000;return(data.workflow_runs||[]).filter(r=>r.head_branch===branch&&new Date(r.created_at).getTime()>=min).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0]||null;}
+export async function getWorkflowRun(repo,id){return request('/repos/'+repo+'/actions/runs/'+id);}
+export async function cancelWorkflowRun(repo,id){return request('/repos/'+repo+'/actions/runs/'+id+'/cancel',{method:'POST'});}
+export async function getJobs(repo,id){const data=await request('/repos/'+repo+'/actions/runs/'+id+'/jobs?per_page=100');return data.jobs||[];}
+export async function getJobLogs(repo,id){const res=await fetch(config.githubApiUrl+'/repos/'+repo+'/actions/jobs/'+id+'/logs',{headers,redirect:'follow',signal:AbortSignal.timeout(30000)});if(!res.ok)throw new Error('Job log HTTP '+res.status);return res.text();}
+export async function getArtifacts(repo,id){const data=await request('/repos/'+repo+'/actions/runs/'+id+'/artifacts?per_page=100');return data.artifacts||[];}
+export async function downloadArtifact(repo,id){const res=await fetch(config.githubApiUrl+'/repos/'+repo+'/actions/artifacts/'+id+'/zip',{headers,redirect:'follow',signal:AbortSignal.timeout(120000)});if(!res.ok)throw new Error('Artifact download HTTP '+res.status);return Buffer.from(await res.arrayBuffer());}
+export function sanitizeLog(value){return String(value).replace(/gh[pousr]_[A-Za-z0-9_]{20,}/g,'[REDACTED_TOKEN]').replace(/github_pat_[A-Za-z0-9_]{20,}/g,'[REDACTED_TOKEN]').replace(/Bearer\\s+[A-Za-z0-9._-]+/gi,'Bearer [REDACTED]').replace(/(password|token|secret|api[_-]?key)(\\s*[:=]\\s*)[^\\s"']+/gi,'$1$2[REDACTED]').replace(/https:\\/\\/[^/\\s]+@/g,'https://[REDACTED]@');}

@@ -1,18 +1,6 @@
 import 'dotenv/config';
-function required(name) {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`Missing required environment variable: ${name}`);
-  return value;
-}
-const adminIds = (process.env.ADMIN_IDS || '').split(',').map(v => v.trim()).filter(Boolean);
-if (!adminIds.length || adminIds.some(v => !/^\d+$/.test(v))) throw new Error('ADMIN_IDS must contain numeric Telegram user IDs separated by commas.');
-export const config = {
-  botToken: required('BOT_TOKEN'), githubToken: required('GITHUB_TOKEN'),
-  adminIds: new Set(adminIds),
-  githubApiUrl: (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, ''),
-  dbPath: process.env.DB_PATH || './data/bot.sqlite',
-  pollIntervalMs: Math.max(5000, Number(process.env.POLL_INTERVAL_MS || 15000)),
-  buildTimeoutMinutes: Math.max(5, Number(process.env.BUILD_TIMEOUT_MINUTES || 45)),
-  maxQueueSize: Math.max(1, Number(process.env.MAX_QUEUE_SIZE || 10)),
-  maxApkMb: Math.max(1, Number(process.env.MAX_APK_MB || 100))
-};
+function required(name){const value=process.env[name]?.trim();if(!value)throw new Error('Missing required environment variable: '+name);return value;}
+const ids=(process.env.ADMIN_IDS||'').split(',').map(x=>x.trim()).filter(Boolean);
+if(!ids.length||ids.some(x=>!/^\d+$/.test(x)))throw new Error('ADMIN_IDS must contain numeric Telegram IDs.');
+function num(name,fallback,min,max){const n=Number(process.env[name]||fallback);if(!Number.isInteger(n)||n<min||n>max)throw new Error(name+' must be between '+min+' and '+max);return n;}
+export const config=Object.freeze({botToken:required('BOT_TOKEN'),githubToken:required('GITHUB_TOKEN'),adminIds:new Set(ids),githubApiUrl:(process.env.GITHUB_API_URL||'https://api.github.com').replace(/\/$/,''),dbPath:process.env.DB_PATH||'./data/bot.sqlite',pollIntervalMs:num('POLL_INTERVAL_MS',15000,5000,120000),buildTimeoutMinutes:num('BUILD_TIMEOUT_MINUTES',60,5,240),maxQueueSize:num('MAX_QUEUE_SIZE',10,1,100),maxConcurrentBuilds:num('MAX_CONCURRENT_BUILDS',1,1,5),maxApkMb:num('MAX_APK_MB',45,1,200),workspaceTtlHours:num('WORKSPACE_TTL_HOURS',24,1,168),workspaceRoot:process.env.WORKSPACE_ROOT||'./storage/workspaces',artifactRetentionDays:num('ARTIFACT_RETENTION_DAYS',3,1,30)});
