@@ -31,7 +31,7 @@ The workflow is installed in the Android target repository, not in this bot repo
 - /cancel queue_id
 - /help
 
-Repository registration validates each branch and checks the Gradle wrapper and settings file. Build selection only lists registered repositories and branches. Removing a repository removes only its bot registration.
+Repository registration validates each branch and checks for Android Gradle settings and an app module at the root or in `android-app/`. Build selection only lists registered repositories and branches. Removing a repository removes only its bot registration.
 
 ## Environment
 
