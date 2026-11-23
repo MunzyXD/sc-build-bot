@@ -1,7 +1,7 @@
 import {config} from './config.js';
 const headers={Authorization:'Bearer '+config.githubToken,Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'SC-APK-Build-Bot'};
 async function request(endpoint,options={}){const res=await fetch(config.githubApiUrl+endpoint,{...options,headers:{...headers,...(options.headers||{})},signal:AbortSignal.timeout(30000)});const raw=await res.text();let data={};try{data=raw?JSON.parse(raw):{};}catch{data={message:raw};}if(!res.ok)throw new Error('GitHub API '+res.status+': '+(data.message||res.statusText));return data;}
-function validRepo(repo){if(!/^[A-Za-z0-9_.-]+\\/[A-Za-z0-9_.-]+$/.test(repo||''))throw new Error('Format repository harus owner/repo.');}
+function validRepo(repo){if(!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo||''))throw new Error('Format repository harus owner/repo.');}
 function validBranch(branch){if(!/^[A-Za-z0-9._/-]{1,200}$/.test(branch||'')||branch.includes('..')||branch.startsWith('/')||branch.endsWith('/'))throw new Error('Nama branch tidak valid.');}
 export async function getRepository(repo){validRepo(repo);return request('/repos/'+repo);}
 export async function validateBranch(repo,branch){validRepo(repo);validBranch(branch);return request('/repos/'+repo+'/branches/'+encodeURIComponent(branch));}
@@ -14,4 +14,4 @@ export async function getJobs(repo,id){const data=await request('/repos/'+repo+'
 export async function getJobLogs(repo,id){const res=await fetch(config.githubApiUrl+'/repos/'+repo+'/actions/jobs/'+id+'/logs',{headers,redirect:'follow',signal:AbortSignal.timeout(30000)});if(!res.ok)throw new Error('Job log HTTP '+res.status);return res.text();}
 export async function getArtifacts(repo,id){const data=await request('/repos/'+repo+'/actions/runs/'+id+'/artifacts?per_page=100');return data.artifacts||[];}
 export async function downloadArtifact(repo,id){const res=await fetch(config.githubApiUrl+'/repos/'+repo+'/actions/artifacts/'+id+'/zip',{headers,redirect:'follow',signal:AbortSignal.timeout(120000)});if(!res.ok)throw new Error('Artifact download HTTP '+res.status);return Buffer.from(await res.arrayBuffer());}
-export function sanitizeLog(value){return String(value).replace(/gh[pousr]_[A-Za-z0-9_]{20,}/g,'[REDACTED_TOKEN]').replace(/github_pat_[A-Za-z0-9_]{20,}/g,'[REDACTED_TOKEN]').replace(/Bearer\\s+[A-Za-z0-9._-]+/gi,'Bearer [REDACTED]').replace(/(password|token|secret|api[_-]?key)(\\s*[:=]\\s*)[^\\s"']+/gi,'$1$2[REDACTED]').replace(/https:\\/\\/[^/\\s]+@/g,'https://[REDACTED]@');}
+export function sanitizeLog(value){return String(value).replace(/gh[pousr]_[A-Za-z0-9_]{20,}/g,'[REDACTED_TOKEN]').replace(/github_pat_[A-Za-z0-9_]{20,}/g,'[REDACTED_TOKEN]').replace(/Bearer\s+[A-Za-z0-9._-]+/gi,'Bearer [REDACTED]').replace(/(password|token|secret|api[_-]?key)(\s*[:=]\s*)[^\s"']+/gi,'$1$2[REDACTED]').replace(/https:\/\/[^/\s]+@/g,'https://[REDACTED]@');}

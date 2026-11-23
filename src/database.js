@@ -7,15 +7,15 @@ const db=new Database(config.dbPath);
 db.pragma('journal_mode = WAL');db.pragma('foreign_keys = ON');db.pragma('busy_timeout = 5000');
 db.exec([
 "CREATE TABLE IF NOT EXISTS users(telegram_id TEXT PRIMARY KEY,username TEXT,role TEXT NOT NULL DEFAULT 'ADMIN',created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_seen_at TEXT)",
-"CREATE TABLE IF NOT EXISTS repositories(id INTEGER PRIMARY KEY AUTOINCREMENT,full_name TEXT NOT NULL UNIQUE,owner TEXT,name TEXT,default_branch TEXT NOT NULL DEFAULT 'main',allowed_branches TEXT NOT NULL DEFAULT '[\\"main\\"]',variant TEXT NOT NULL DEFAULT 'debug',apk_glob TEXT NOT NULL DEFAULT '**/build/outputs/apk/**/*.apk',created_by TEXT NOT NULL DEFAULT 'system',created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+"CREATE TABLE IF NOT EXISTS repositories(id INTEGER PRIMARY KEY AUTOINCREMENT,full_name TEXT NOT NULL UNIQUE,owner TEXT,name TEXT,default_branch TEXT NOT NULL DEFAULT 'main',allowed_branches TEXT NOT NULL DEFAULT '[\"main\"]',variant TEXT NOT NULL DEFAULT 'debug',apk_glob TEXT NOT NULL DEFAULT '**/build/outputs/apk/**/*.apk',created_by TEXT NOT NULL DEFAULT 'system',created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
 "CREATE TABLE IF NOT EXISTS builds(id INTEGER PRIMARY KEY AUTOINCREMENT,build_id TEXT UNIQUE,repo TEXT NOT NULL,branch TEXT NOT NULL,variant TEXT NOT NULL,chat_id TEXT NOT NULL,user_id TEXT NOT NULL,telegram_id TEXT,status TEXT NOT NULL DEFAULT 'QUEUED',workflow_run_id TEXT,dispatch_time TEXT,queued_at TEXT,started_at TEXT,finished_at TEXT,updated_at TEXT DEFAULT CURRENT_TIMESTAMP,error TEXT,artifact_id TEXT,artifact_name TEXT,delivery_status TEXT DEFAULT 'PENDING')",
 "CREATE TABLE IF NOT EXISTS workspaces(workspace_id TEXT PRIMARY KEY,build_id TEXT UNIQUE,owner_id TEXT,path TEXT,created_at TEXT,expires_at TEXT,cleanup_status TEXT DEFAULT 'PENDING')",
 "CREATE TABLE IF NOT EXISTS build_history(id INTEGER PRIMARY KEY AUTOINCREMENT,build_id TEXT UNIQUE,result TEXT,duration_ms INTEGER,artifact_name TEXT,delivery_status TEXT,error_summary TEXT,finished_at TEXT)",
 "CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,telegram_id TEXT,action TEXT,details TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
 "CREATE TABLE IF NOT EXISTS cleanup_retry(id INTEGER PRIMARY KEY AUTOINCREMENT,workspace_id TEXT,path TEXT,attempts INTEGER DEFAULT 0,last_error TEXT)"
-].join('\\n'));
+].join('\n'));
 function addColumn(table,name,definition){const cols=db.prepare('PRAGMA table_info('+table+')').all();if(!cols.some(c=>c.name===name))db.exec('ALTER TABLE '+table+' ADD COLUMN '+name+' '+definition);}
-for(const [name,definition] of Object.entries({owner:'TEXT',name:'TEXT',allowed_branches:"TEXT NOT NULL DEFAULT '[\\"main\\"]'",apk_glob:"TEXT NOT NULL DEFAULT '**/build/outputs/apk/**/*.apk'"}))addColumn('repositories',name,definition);
+for(const [name,definition] of Object.entries({owner:'TEXT',name:'TEXT',allowed_branches:"TEXT NOT NULL DEFAULT '[\"main\"]'",apk_glob:"TEXT NOT NULL DEFAULT '**/build/outputs/apk/**/*.apk'"}))addColumn('repositories',name,definition);
 for(const [name,definition] of Object.entries({build_id:'TEXT',telegram_id:'TEXT',queued_at:'TEXT',started_at:'TEXT',finished_at:'TEXT',artifact_id:'TEXT',delivery_status:"TEXT DEFAULT 'PENDING'"}))addColumn('builds',name,definition);
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_build_id ON builds(build_id) WHERE build_id IS NOT NULL; CREATE INDEX IF NOT EXISTS idx_build_status ON builds(status,queued_at,id);");
 export const users={upsert:db.prepare("INSERT INTO users(telegram_id,username,role,last_seen_at) VALUES(@telegram_id,@username,'ADMIN',CURRENT_TIMESTAMP) ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username,last_seen_at=CURRENT_TIMESTAMP")};
